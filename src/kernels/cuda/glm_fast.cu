@@ -4642,12 +4642,27 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
     }
 }
 
+// wide-fetch variant (local port of 95af3292): 32-byte vector loads, one expert per block row.
+// Same link, same bytes - wider transactions can push closer to the per-link ceiling when
+// several experts stream back to back (MAYA_GLM_FETCH_WIDE / STRATA_GLM_FETCH_WIDE =1).
+__global__ void __launch_bounds__(256) moe_fetch_kernel_wide(MoeDev d, int k, size_t n16) {
+    const int expert = blockIdx.y;
+    if (expert >= k) return;
+    const unsigned long long src = d.fetch_src[expert];
+    if (src == 0ull) return;
+    const ulonglong4* s = (const ulonglong4*) src;   // 32 B a load
+    ulonglong4* t = (ulonglong4*) d.plan_ptr[expert];
+    const size_t n32 = n16 / 2 + (n16 & 1);
+    for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n32; j += (size_t) gridDim.x * blockDim.x)
+        t[j] = s[j];
+}
+
 // moe_wait + moe_fetch in one launch (STRATA_GLM_SKIP_EMPTY, the batched rows): block 0 waits for the host's answer to
 // the route's disk misses (when it had any) and applies it as moe_wait does, then hands the misses' sources to the
 // other blocks through fetch_src and a reset wait_seq (device memory: they spin on L2, not on the host over PCIe); every
 // block then copies its share of each entry with a source, as moe_fetch does.  A route with neither (most of them)
 // costs one near-empty launch instead of two launches and the gap between them.
-__global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16) {
+__global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16, int wide) {
     __shared__ unsigned int s_need;
     __shared__ unsigned long long s_src[8];
     const int tid = threadIdx.x;
@@ -4701,6 +4716,14 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
         if (src == 0ull) continue;
         if ((s_sm >> i) & 1u) {
             moe_stream_copy(d, i, (const uint8_t*) src, (uint8_t*) d.plan_ptr[i]);
+            continue;
+        }
+        if (wide) {   // wide-fetch (local port): 32 B a load instead of 16 B
+            const ulonglong4* s = (const ulonglong4*) src;
+            ulonglong4* t = (ulonglong4*) d.plan_ptr[i];
+            const size_t n32 = n16 / 2 + (n16 & 1);
+            for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n32; j += (size_t) gridDim.x * blockDim.x)
+                t[j] = s[j];
             continue;
         }
         const uint4* s = (const uint4*) src;
@@ -6733,6 +6756,16 @@ void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_
     launch_check("moe_pf_wait");
 }
 
+// wide-fetch (local port of 95af3292): MAYA_GLM_FETCH_WIDE / STRATA_GLM_FETCH_WIDE =1
+static bool glm_fetch_wide() {
+    static const bool w = [] {
+        const char* v = getenv("MAYA_GLM_FETCH_WIDE");
+        if (!v) v = getenv("STRATA_GLM_FETCH_WIDE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return w;
+}
+
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
     static int sms = 0;
     if (sms == 0) {
@@ -6740,6 +6773,12 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
+    }
+    if (glm_fetch_wide()) {
+        dim3 grid(sms, k);
+        moe_fetch_kernel_wide<<<grid, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
+        launch_check("moe_fetch_wide");
+        return;
     }
     moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
@@ -6753,7 +6792,7 @@ void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaS
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
     }
-    moe_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
+    moe_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, glm_fetch_wide() ? 1 : 0);
     launch_check("moe_wait_fetch");
 }
 
