@@ -473,7 +473,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                               src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
-                          ${_strata_gpu_blas_target})
+                          ${_strata_gpu_blas_target} strata_spec)
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
       target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
@@ -866,12 +866,16 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
+                           src/spec/recall_drafter.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
+  add_executable(recall_drafter_test src/spec/recall_drafter_test.cpp)
+  target_link_libraries(recall_drafter_test PRIVATE strata_spec)
+  add_test(NAME recall_drafter_test COMMAND recall_drafter_test)
   add_executable(controller_test src/spec/controller_test.cpp)
   target_link_libraries(controller_test PRIVATE strata_spec)
   add_test(NAME controller_test COMMAND controller_test)

@@ -29,6 +29,12 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     const int64_t qi = blockIdx.y;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    // The identity selection (n_kv <= width, qsa.hpp: the selection is every visible cell) never reads
+    // the scores - block_topk writes the ids 0..n_kv-1 itself.  Skipping the dot products below the
+    // dense boundary is TensorFold #1054's finding (a 16,384-key scan took 11x less on their Metal
+    // kernel); here the whole launch returns when its query is in that state, so a captured graph's
+    // capacity grid is unchanged and the kernel simply does no work.
+    if (n_kv <= st[kStepWidth]) return;
     const int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     const int lane = threadIdx.x & 31;
@@ -206,6 +212,12 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
         *reinterpret_cast<float4*>(sQ + r * TC_QS + c * 4) = v;
     }
     if (t < TC_QT) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
+    __shared__ int s_ident[TC_QT];   // (a query in the identity state: its scores are never read)
+    if (t < TC_QT) s_ident[t] = q0 + t < nq && steps[(q0 + t) * kStepCount + kStepNKv] <=
+                                                 steps[(q0 + t) * kStepCount + kStepWidth];
+    int ident_all = 1;
+    for (int i = 0; i < TC_QT; ++i) ident_all = ident_all && s_ident[i];
+    if (ident_all) return;           // (no query of this tile needs scores)
     int lo_nbid = 0x7fffffff, hi_nbid = 0;
     __syncthreads();
     for (int i = 0; i < TC_QT; ++i) {
@@ -284,6 +296,7 @@ __global__ void __launch_bounds__(32) block_scores_tail_kernel(const float* __re
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    if (n_kv <= st[kStepWidth]) return;   // (the identity selection never reads the scores)
     if (n_bid >= max_blocks) return;
     const int lane = threadIdx.x & 31;
     const float4 k4 = *reinterpret_cast<const float4*>(dead + lane * 4);

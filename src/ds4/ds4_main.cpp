@@ -49,6 +49,8 @@
 #include <cerrno>
 #endif
 
+#include "strata/spec/recall_drafter.hpp"
+
 namespace {
 
 double now_ms() {
@@ -203,6 +205,25 @@ float dspark_cum_default() {
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
+// A copy round: the record's continuation for the current suffix, verified by the target.  The bits are
+// the model's own picks - a copy that misses costs only the round's drafts (land()/miss() bookkeeping is
+// the caller's).  Returns false on an engine error only.
+bool copy_round(strata::ds4::Model& m, int tok, const std::vector<int>& drafts, float temperature, float top_p,
+                int top_k, float min_p, unsigned long long seed, unsigned long long& counter,
+                std::vector<int>& out, int& offered, int& accepted, std::string& err) {
+    out.clear();
+    offered = accepted = 0;
+    if (drafts.empty()) return true;
+    int acc = 0, next = -1;
+    if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+    counter += (unsigned long long) acc + 1;
+    for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
+    out.push_back(next);
+    offered = (int) drafts.size();
+    accepted = acc;
+    return true;
+}
+
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
            int& accepted, std::string& err, float cum_min = -1.0f) {
@@ -379,6 +400,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (dump_f != nullptr && m.logits(dump_lg)) std::fwrite(dump_lg.data(), 4, dump_lg.size(), dump_f);
     };
     SpanCache spans;
+    // Recall (TensorFold's --recall idea on this engine's SuffixDrafter): one token-id record across
+    // requests and restarts, proposed before the DSpark drafter when its match is long enough.  Every
+    // copied token is verified by the target, so replies are the same tokens as without it.
+    // DS4_RECALL=0: off.  DS4_RECALL_DIR: the record's directory (default ~/.cache/maya-ds4/recall).
+    const bool recall_on = [] {
+        const char* v = std::getenv("DS4_RECALL");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    std::unique_ptr<strata::spec::RecallDrafter> recall;
+    if (recall_on) {
+        std::string rdir = std::getenv("DS4_RECALL_DIR") ? std::getenv("DS4_RECALL_DIR")
+                                                         : std::string(getenv("HOME") ? getenv("HOME") : ".") +
+                                                               "/.cache/maya-ds4/recall";
+        std::error_code ec;
+        std::filesystem::create_directories(rdir, ec);
+        recall = std::make_unique<strata::spec::RecallDrafter>((size_t) m.max_context() + (1u << 20),
+                                                               rdir + "/record.bin");
+        std::fprintf(stderr, "maya ds4 serve: recall %s (%zu tokens held)\n",
+                     recall->size() > 0 ? "resumed" : "started", recall->size());
+    }
     const int img_tok = m.image_token();
     // CONVERSATION SLOTS: a request that does not continue the conversation in the model first sets that one aside
     // (Model::slot_save: its window rings, the compressors' partial groups and every source's compressed KV and index
@@ -925,6 +966,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         held = std::move(pics);
         m.checkpoint(0);
         if (!continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
+        // the record: this prompt's newly-read tokens (from `from` on; the reused part the record
+        // already holds from the request that read it first)
+        if (recall && total > from) recall->append(r.ids.data() + from, total - from);
         const double t1 = now_ms();
         const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
         long long produced = 0;
@@ -994,6 +1038,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
                 out += b;
             }
+            if (recall && recall->offers() > 0) {   // (the record drafter: how its copies are landing)
+                std::snprintf(b, sizeof b, " recall=%lld/%lld kept=%lld", (long long) recall->lands(),
+                              (long long) recall->offers(), (long long) recall->kept_tokens());
+                out += b;
+            }
             if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
                 std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
                 out += b;
@@ -1015,6 +1064,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::printf("T %d\n", tok);
             ++produced;
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
+            if (recall) recall->append(tok);   // the record: every committed token as it is published
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
             bool end = false;
@@ -1033,15 +1083,42 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
-                if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
+                // Recall first: a copy from the record costs no drafter pass, and its expected kept
+                // tokens (its own land rates at this match length) beat the DSpark rate.  The target
+                // verifies every copied token, so the reply's tokens never change.
+                bool copied = false;
+                if (recall && room > 1) {
+                    const int dspark_kept = d_off > 0 ? (int) ((double) d_acc / (double) d_off * 5.0) : 0;
+                    if (recall->offer(dspark_kept)) {
+                        std::vector<int32_t> rb((size_t) std::min(room - 1, 64));
+                        const int rk = recall->propose((int) rb.size(), rb.data(), dspark_kept);
+                        if (rk > 0) {
+                            std::vector<int> rd(rb.begin(), rb.begin() + rk);
+                            if (!copy_round(m, tok, rd, r.temperature, r.top_p, r.top_k, r.min_p, r.seed,
+                                            counter, got, off, acc, err)) {
+                                std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                                finish = "cancel";
+                                break;
+                            }
+                            copied = true;
+                            recall->land(off, acc);
+                            d_off += off;
+                            d_acc += acc;
+                        }
+                    }
+                }
+                if (!copied &&
+                    !round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
                 }
-                d_off += off;
-                d_acc += acc;
+                if (!copied) {
+                    d_off += off;
+                    d_acc += acc;
+                }
                 cool = try_spec && off == 0;
                 if (close_think && !got.empty()) got.back() = r.think_end;   // (room 1: one token, not fed yet)
                 std::reverse(got.begin(), got.end());

@@ -4028,6 +4028,10 @@ class Server(ThreadingHTTPServer):
     # "connection reset by peer" on the first ones (Strata 0.1.41); the requests wait in the server's queue instead
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
+    # TCP_NODELAY on every accepted connection (TensorFold #929's fix): a streamed reply's small writes
+    # leave as they are written instead of waiting behind Nagle's algorithm for an ACK that a LAN client
+    # has no reason to send soon.  Disabled with STRATA_TCP_NODELAY=0.
+    disable_nagle_algorithm = os.environ.get("STRATA_TCP_NODELAY", "1") != "0"
 
     def server_close(self):
         service = getattr(self, "response_service", None)
