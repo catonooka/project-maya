@@ -2596,11 +2596,13 @@ class Service:
                 think_budget = self.think_budget
                 if in_think and max_new:
                     reserve = max(int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024), int(max_new) // 4)
-                    # (the reserve is a floor, not a ruler: a request asking for fewer tokens than the floor
-                    #  still gets its share to think with - max(1, ...) below used to crush the budget to 1
-                    #  token whenever max_tokens <= 1024, closing the think block after one word and answering
-                    #  from nothing (v1.1.24's #363 on a small max_tokens: chain-math 362 -> 323))
-                    reserve = min(reserve, max(1, int(max_new) - 1))
+                    # (a small max_tokens must still think: upstream's #363 took max_new - reserve, and
+                    #  the 1024 reserve floor made that <= 0 for any max_tokens <= 1024 - crushed to 1
+                    #  by the max(1, ..), the think block closed after one word and the model answered
+                    #  from nothing (chain-math 362 -> 323 at max_tokens 200).  A small request now
+                    #  reserves a QUARTER of its tokens for the answer, not the 1024 floor)
+                    if int(max_new) <= reserve:
+                        reserve = max(1, int(max_new) // 4)
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
