@@ -1,0 +1,8 @@
+jinja2
+fastapi
+uvicorn
+psutil
+regex
+requests
+pillow
+numpy

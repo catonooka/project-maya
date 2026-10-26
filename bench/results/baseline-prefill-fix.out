@@ -1,0 +1,7 @@
+[baseline-prefill-fix r1] essay: 49p 256t in 11.0s = 23.26 t/s
+[baseline-prefill-fix r1] facts: 46p 197t in 7.8s = 25.38 t/s
+[baseline-prefill-fix r1] code: 46p 256t in 11.3s = 22.56 t/s
+[baseline-prefill-fix] prefill25k: 33200 tokens in 28.5s = 1166.7 t/s
+== essay: mean 23.26 t/s (runs: [23.26])
+== facts: mean 25.38 t/s (runs: [25.38])
+== code: mean 22.56 t/s (runs: [22.56])

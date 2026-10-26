@@ -1,0 +1,10 @@
+{"tag": "v1128-base", "depth": 2000, "prompt_tokens": 2018, "completion_tokens": 18, "wall_s": 8.12, "tps": 2.22, "needle_probe": "BANANA-7741", "needle_hit": true}
+{"tag": "v1128-base", "depth": 2000, "prompt_tokens": 1617, "completion_tokens": 384, "wall_s": 21.99, "client_tps": 17.46, "engine_tok": 384, "engine_tps": 26.6, "needle": "BANANA-7741", "needle_hit": true}
+{"tag": "v1128-base", "depth": 6000, "prompt_tokens": 4516, "completion_tokens": 384, "wall_s": 23.63, "client_tps": 16.25, "engine_tok": 384, "engine_tps": 25.9, "needle": "ZEPHYR-9042", "needle_hit": true}
+{"tag": "v1128-base", "depth": 12000, "prompt_tokens": 8914, "completion_tokens": 384, "wall_s": 26.77, "client_tps": 14.34, "engine_tok": 384, "engine_tps": 27.7, "needle": "ORCHID-3319", "needle_hit": true}
+{"tag": "v1128-base", "depth": 24000, "prompt_tokens": 17586, "completion_tokens": 384, "wall_s": 33.65, "client_tps": 11.41, "engine_tok": 384, "engine_tps": 26.3, "needle": "CANYON-6125", "needle_hit": true}
+{"tag": "v1128-base", "depth": 48000, "prompt_tokens": 35131, "completion_tokens": 384, "wall_s": 46.17, "client_tps": 8.32, "engine_tok": 384, "engine_tps": 26.5, "needle": "MARLIN-2280", "needle_hit": true}
+{"tag": "v1128-base", "depth": 96000, "prompt_tokens": 70008, "completion_tokens": 384, "wall_s": 71.66, "client_tps": 5.36, "engine_tok": 384, "engine_tps": 28.5, "needle": "JUNIPER-5533", "needle_hit": true}
+{"tag": "v1128-cap", "depth": 200000, "prompt_tokens": 145635, "completion_tokens": 384, "wall_s": 135.73, "client_tps": 2.83, "engine_tok": 384, "engine_tps": 26.3, "needle": "BANANA-7741", "needle_hit": true}
+{"tag": "v1128-cap", "depth": 260000, "prompt_tokens": 189436, "completion_tokens": 384, "wall_s": 175.72, "client_tps": 2.19, "engine_tok": 384, "engine_tps": 28.8, "needle": "ZEPHYR-9042", "needle_hit": true}
+{"tag": "idxtc-ctx", "depth": 24000, "prompt_tokens": 17586, "completion_tokens": 384, "wall_s": 34.71, "client_tps": 11.06, "engine_tok": 384, "engine_tps": 26.2, "needle": "BANANA-7741", "needle_hit": true}

@@ -857,9 +857,10 @@ union MixSmem {
     BlockSmem<4> k2;
     BlockSmem<6> k3;
     BlockSmem<8> k4;
+    BlockSmem<10> k5;   // 0xSero's 2.7bpw: a few layers' experts at K 5 (k2 10) - the odd K takes cb 2
 };
 __device__ __forceinline__ float* mix_out(int k2, MixSmem& u) {
-    return k2 == 2 ? u.k1.out : k2 == 4 ? u.k2.out : k2 == 6 ? u.k3.out : u.k4.out;
+    return k2 == 2 ? u.k1.out : k2 == 4 ? u.k2.out : k2 == 6 ? u.k3.out : k2 == 8 ? u.k4.out : u.k5.out;
 }
 // (the token and the window kernels inline it each their own way: their bits agree because the HIP build fuses
 // multiply-adds only where the source writes them - CMakeLists.txt, -ffp-contract=on for this file)
@@ -870,7 +871,8 @@ __device__ __forceinline__ void mix_gemv(int k2, const uint32_t* tr, int ld, int
     case 2: block_gemv<2, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k1); break;
     case 4: block_gemv<4, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k2); break;
     case 6: block_gemv<6, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k3); break;
-    default: block_gemv<8, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k4); break;
+    case 8: block_gemv<8, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k4); break;
+    default: block_gemv<10, cb, Input, 1>(tr, ld, tc0, k0, k1, x, suh, nc, u.k5); break;
     }
 }
 
@@ -2103,7 +2105,7 @@ static bool mix_launch(const MixedLayouts& mx, F&& f) {
 bool mixed_supported(const ExpertLayout& lay) {
     if (lay.fmt != 0 || lay.cb < 0 || lay.cb > 2) return false;
     for (int r = 0; r < 3; ++r)
-        if (lay.k2[r] != 2 && lay.k2[r] != 4 && lay.k2[r] != 6 && lay.k2[r] != 8) return false;
+        if (lay.k2[r] != 2 && lay.k2[r] != 4 && lay.k2[r] != 6 && lay.k2[r] != 8 && lay.k2[r] != 10) return false;
     return true;
 }
 static bool mixed_ok(const MixedLayouts& mx, const char* what) {
