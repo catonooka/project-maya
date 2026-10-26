@@ -25,6 +25,28 @@ void check(bool ok, const char* what) {
 }
 }  // namespace
 
+// a damaged record (a truncated or misaligned tail read as a chunk length) must not size an
+// allocation: the load ends, the good prefix stays, no abort (the 4.6 TB bad_alloc crash)
+static bool damaged_record_test() {    const char* dir = std::getenv("RECALL_TEST_DIR");
+    std::string path = std::string(dir ? dir : "/tmp") + "/record-damaged.bin";
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) return false;
+        const uint64_t magic = 0x52454341'4C4C3031ull;   // "RECALL01" - the loader's own
+        std::fwrite(&magic, sizeof magic, 1, f);
+        int64_t n = 8; std::vector<int32_t> run = {1, 2, 3, 4, 5, 6, 7, 8};
+        std::fwrite(&n, sizeof n, 1, f);
+        std::fwrite(run.data(), 4, run.size(), f);
+        int64_t garbage = 0x43800001000ll;              // a token pair as a length: 4.6 TB
+        std::fwrite(&garbage, sizeof garbage, 1, f);
+        std::fclose(f);
+    }
+    strata::spec::RecallDrafter r(1 << 20, path);
+    if (r.size() != 8) return false;                    // the good prefix survives
+    std::remove(path.c_str());
+    return true;
+}
+
 int main(int argc, char** argv) {
     const char* dir = argc > 1 ? argv[1] : ".";
     std::string path = std::string(dir) + "/recall-test.rec";
@@ -96,6 +118,10 @@ int main(int argc, char** argv) {
     }
 
     std::remove(path.c_str());
+    {
+        std::printf("  a damaged record loads its good prefix and does not abort\n");
+        check(damaged_record_test(), "damaged record: prefix kept, no bad_alloc");
+    }
     std::printf("%s\n", g_fail ? "FAILURES" : "all ok");
     return g_fail ? 1 : 0;
 }

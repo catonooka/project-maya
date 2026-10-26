@@ -29,6 +29,8 @@ public:
     RecallDrafter(size_t capacity_tokens, std::string persist_path);
     ~RecallDrafter();
 
+    size_t capacity() const { return cap_tokens_; }   // the loader's chunk-length sanity bound
+
     /// Tokens into the record: a prompt's newly-read part, then every committed token.  A run the
     /// record already holds at its end is not added again.
     void append(const int32_t* tokens, size_t n);
@@ -73,6 +75,7 @@ private:
     SuffixDrafter sfx_;            // the record (its history IS the record)
     std::string path_;
     std::FILE* f_ = nullptr;
+    size_t cap_tokens_ = 0;        // the capacity the loader's chunk lengths are bounded by
     std::vector<int32_t> tail_;    // the record's last dedup_run tokens (the dedup check)
     std::vector<int32_t> pending_; // tokens not yet on disk (flushed in batches and at the end)
     int64_t landed_[kBuckets] = {}, missed_[kBuckets] = {};

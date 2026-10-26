@@ -23,7 +23,7 @@ bool run_held(const std::vector<int32_t>& tail, const int32_t* tokens, int n) {
 }  // namespace
 
 RecallDrafter::RecallDrafter(size_t capacity_tokens, std::string persist_path)
-    : sfx_(3, 256, capacity_tokens), path_(std::move(persist_path)) {
+    : sfx_(3, 256, capacity_tokens), path_(std::move(persist_path)), cap_tokens_(capacity_tokens) {
     // (min_match 3: the drafter finds the longest match itself; the OFFER floor is this class's rule)
     tail_.reserve((size_t) dedup_run + 1);
     if (path_.empty()) return;
@@ -37,7 +37,10 @@ RecallDrafter::RecallDrafter(size_t capacity_tokens, std::string persist_path)
             std::vector<int32_t> buf;
             for (;;) {
                 int64_t n = 0;
-                if (std::fread(&n, sizeof n, 1, in) != 1 || n <= 0) break;
+                // a damaged or misaligned tail must not size an allocation: a run is capped by the
+                // capacity (a chunk that claims more than fits, or a token pair read as a length
+                // like 0x43800001000, ends the load - the record's good prefix stays)
+                if (std::fread(&n, sizeof n, 1, in) != 1 || n <= 0 || n > (int64_t) cap_tokens_) break;
                 buf.assign((size_t) n, 0);
                 if (std::fread(buf.data(), 4, (size_t) n, in) != (size_t) n) break;
                 sfx_.append(buf.data(), (size_t) n);
