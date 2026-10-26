@@ -47,6 +47,40 @@ static bool damaged_record_test() {    const char* dir = std::getenv("RECALL_TES
     return true;
 }
 
+
+// tier B: a semi-repeat (a shared 10-token header, then different tails) may offer below tier A's
+// 16 floor; the first offer after warm stats must still respect the bar (dspark_kept high: refuse)
+static void tier_b_test() {
+    const char* dir = std::getenv("RECALL_TEST_DIR");
+    std::string path = std::string(dir ? dir : "/tmp") + "/recall-test-b.rec";
+    std::remove(path.c_str());
+    RecallDrafter r(1u << 20, path);
+    std::vector<int32_t> header(10), tail1(200), tail2(200);
+    for (int i = 0; i < 10; ++i) header[(size_t) i] = 9000 + i;         // shared
+    for (int i = 0; i < 200; ++i) tail1[(size_t) i] = 50000 + i;        // instance 1's body
+    std::vector<int32_t> one;
+    one.insert(one.end(), header.begin(), header.end());
+    one.insert(one.end(), tail1.begin(), tail1.end());
+    r.append(one.data(), one.size());
+    // the new request replays the header (its suffix ENDS with the header: that is what matches)
+    r.append(header.data(), header.size());
+    std::vector<int32_t> out(64);
+    // dspark_kept = 0 (nothing measured): the tier-B offer is allowed
+    const int k = r.propose(64, out.data(), 0);
+    check(k > 0, "tier B: an 8-15 match offers when the drafter is unmeasured");
+    // a hard dspark bar: refused (0.55 prior * 8 = 4.4 expected < 6)
+    const int k2 = r.propose(64, out.data(), 6);
+    check(k2 == 0, "tier B: the 1.35x bar refuses when the drafter is strong");
+    // and a landing/miss cycle behaves: land a miss, expect cooldown to refuse next probe
+    const int k3 = r.propose(64, out.data(), 0);
+    check(k3 > 0, "tier B: probes again while unmeasured");
+    r.land(k3, 0);
+    const bool off4 = r.offer(0);   // the serve loop's shape: offer() gates, propose() follows
+    const int k4 = off4 ? r.propose(64, out.data(), 0) : 0;
+    check(!off4 && k4 == 0, "tier B: a miss cools down (8 rounds)");
+    std::remove(path.c_str());
+}
+
 int main(int argc, char** argv) {
     const char* dir = argc > 1 ? argv[1] : ".";
     std::string path = std::string(dir) + "/recall-test.rec";
@@ -122,6 +156,7 @@ int main(int argc, char** argv) {
         std::printf("  a damaged record loads its good prefix and does not abort\n");
         check(damaged_record_test(), "damaged record: prefix kept, no bad_alloc");
     }
+    tier_b_test();
     std::printf("%s\n", g_fail ? "FAILURES" : "all ok");
     return g_fail ? 1 : 0;
 }

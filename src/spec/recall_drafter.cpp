@@ -128,20 +128,44 @@ int RecallDrafter::propose(int max_k, int32_t* out, int dspark_kept) {
     const int m = sfx_.propose(1, scratch);
     if (m <= 0) return 0;
     const int match = sfx_.last_match();
-    if (match < kMinOfferMatch) return 0;
+    const bool tier_b = match < kMinOfferMatch;
+    if (tier_b && match < kMinBMatch) return 0;
     // Recall's rule: a copy is offered when its expected kept tokens beat the drafter's measured
     // kept-tokens-a-round.  The expectation is the bucket's land rate times a typical landing (the
     // matched run's length is the ceiling; the rate is how often copies at this length land at all).
-    const double expect = land_rate(match) * (double) std::min(match, 16);
-    if (dspark_kept > 0 && expect <= (double) dspark_kept) return 0;
+    const double rate = tier_b ? land_rate_b() : land_rate(match);
+    const double expect = rate * (double) std::min(match, tier_b ? 8 : 16);
+    if (dspark_kept > 0) {
+        // tier A must merely beat the drafter; tier B must clear it by kBarB (its misses cost the
+        // round more, and its rate estimate is noisier at these lengths)
+        const double bar = tier_b ? (double) dspark_kept * kBarB : (double) dspark_kept;
+        if (expect <= bar) return 0;
+    }
     const int k = sfx_.propose(max_k, out);
     if (k <= 0) return 0;
-    ++offers_;
+    if (tier_b) ++offers_b_; else ++offers_;
     return k;
 }
 
 void RecallDrafter::land(int offered, int kept) {
     if (offered <= 0) return;
+    const bool tier_b = last_match() < kMinOfferMatch;
+    if (tier_b) {
+        if (kept > 0) {
+            ++landed_b_;
+            ++lands_;
+            kept_tokens_ += kept;
+            kept_b_ += kept;
+            cooldown_ = 0;
+            probe_every_ = 1;
+        } else {
+            ++missed_b_;
+            cooldown_ = kCooldownRoundsB;
+            probe_every_ = std::min(probe_every_ * 2, 64);
+        }
+        since_probe_ = 1;
+        return;
+    }
     const int b = bucket(last_match());
     if (kept > 0) {
         ++landed_[b];
