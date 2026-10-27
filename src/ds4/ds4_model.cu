@@ -12753,6 +12753,46 @@ struct Model::Impl {
         pos += n;
         st.tokens += n;
         cache_tick(n);
+        {   // (S5: a prompt's own routing is its decode's near-future - pull its hottest CPU-lane
+            //  experts in right here, before the first token pays the lane for them. DS4_PROMPT_SWAPS
+            //  a layer, 0 off. The regular tick machinery handles the switches as they land.)
+            const char* ps = std::getenv("DS4_PROMPT_SWAPS");
+            const int kps = ps != nullptr ? std::max(0, std::atoi(ps)) : 4;
+            if (kps > 0 && n >= 32 && !L.empty() && L[0].n_cls > 1 && !L[0].maddr.empty() &&
+                std::getenv("DS4_MIX_SWAP") != nullptr && !cache_ths.empty()) {
+                const unsigned w_now = win_now.load(std::memory_order_relaxed);
+                for (int il = 0; il < g.nl; ++il) {
+                    Layer& l = L[(size_t) il];
+                    if (l.cpu_hits.empty() && l.heat.empty()) continue;
+                    std::vector<int> hits;
+                    hits.swap(l.cpu_hits);
+                    std::vector<int> want;
+                    for (int e : hits)
+                        if (l.slot[(size_t) e] < 0 && l.maddr[(size_t) e] == nullptr && !helper_owned(l, e))
+                            want.push_back(e);
+                    std::sort(want.begin(), want.end(), [&](int a, int b) { return l.heat[(size_t) a] > l.heat[(size_t) b]; });
+                    if ((int) want.size() > kps) want.resize((size_t) kps);
+                    for (int e : want) {
+                        // a victim: the coldest in VRAM of e's class (skip if none)
+                        int cold = -1;
+                        for (int q = 0; q < l.n_exp; ++q)
+                            if (l.maddr[(size_t) q] != nullptr && l.cls[(size_t) q] == l.cls[(size_t) e] &&
+                                (cold < 0 || l.heat[(size_t) q] < l.heat[(size_t) cold]))
+                                cold = q;
+                        if (cold < 0 || l.heat[(size_t) e] <= l.heat[(size_t) cold]) continue;
+                        if (sw_inflight >= c_inflight + 64) break;   // (bounded burst)
+                        l.swap_pending = true;
+                        l.sw_in = e;
+                        ++sw_inflight;
+                        Swap sw{l.il, e, cold};
+                        sw.win = w_now;
+                        std::lock_guard<std::mutex> lk(sw_mu);
+                        sw_queue.push_back(sw);
+                    }
+                }
+                sw_cv.notify_all();
+            }
+        }
         warm_after(n);
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
