@@ -4888,28 +4888,43 @@ struct Model::Impl {
                 room = std::max(0.0, room - std::min(capped, all) * nm);
                 for (double& v : own) v = std::min(v, capped);   // (DS4_TP_GGUF_UNEVEN's fit: the commit's share too)
             }
-            // a mixed-precision layer's experts: the hot subset the room holds (profile-chosen as the uniform path's
-            // below - every class's hottest first by its share a byte), the rest to the CPU lane (MIXED-LANE S1)
-            for (Layer& l : L)
-                if (l.grp == (int) gi && l.n_cls > 1) {
+            // a mixed-precision layer's experts: the hot subset the room holds, the rest to the CPU
+            // lane (MIXED-LANE S1; S5: the group's globally-hottest first - a waterline, not layer
+            // sequential, else the first layers eat the room and later ones starve)
+            {
+                auto eb_of = [&](const Layer& q, int e) { return (double) align256(q.cblob[q.cls[(size_t) e]]); };
+                struct CE { double s; int il, e; double b; };
+                std::vector<CE> cand;
+                bool any = false;
+                for (const Layer& q : L)
+                    if (q.grp == (int) gi && q.n_cls > 1) {
+                        any = true;
+                        const uint32_t* p = prof.data() + (size_t) q.il * g.n_exp;
+                        double sum = 0;
+                        for (int e = 0; e < q.n_exp; ++e) sum += p[e];
+                        for (int e = 0; e < q.n_exp; ++e)
+                            cand.push_back({sum > 0 ? (double) p[e] / sum : 0.0, q.il, e, eb_of(q, e)});
+                    }
+                if (any) {
+                    double r = mroom[0];
+                    std::stable_sort(cand.begin(), cand.end(), [](const CE& a, const CE& b) { return a.s > b.s; });
+                    std::vector<int> got(L.size(), 0);
+                    for (const CE& c : cand) {
+                        if (r < c.b) continue;
+                        r -= c.b;
+                        ++got[(size_t) c.il];
+                    }
+                    for (Layer& q : L)
+                        if (q.grp == (int) gi && q.n_cls > 1) q.n_vram = got[(size_t) q.il];
+                    mroom[0] = r;
+                }
+            }
+            if (false) {
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.n_cls > 1) {
                     l.n_vram = 0;
-                    // each expert's bytes = its class's blob
                     auto eb = [&](int e) { return (double) align256(l.cblob[l.cls[(size_t) e]]); };
-                    if (mroom.size() == 1 || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {
-                        // as room goes, the profile's hottest first (the lane's cost is per expert hit)
-                        double r = mroom[0];
-                        std::vector<std::pair<double, int>> by_k;   // (bytes an expert, e)
-                        for (int e = 0; e < l.n_exp; ++e) by_k.push_back({eb(e), e});
-                        std::sort(by_k.begin(), by_k.end());
-                        int nv = 0;
-                        for (const auto& p : by_k) {
-                            if (r < p.first) break;
-                            r -= p.first;
-                            ++nv;
-                        }
-                        l.n_vram = nv;
-                        mroom[0] = r;
-                    } else {
+                    if (false) {
                         // by the profile: the hottest experts first (absolute share - the K plan's supers
                         // and the panel's hot heads; per-byte would pack the small cold K2s instead)
                         const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
@@ -4934,7 +4949,8 @@ struct Model::Impl {
                         l.n_vram = nv;
                         mroom[0] = r;
                     }
-                }
+                    }
+            }
             // the drafter's experts first (every draft uses its blocks) - a block is its member's alone (the lead's,
             // unless DS4_DRAFT_DEV names another), so it takes that member's room; the trunk's layers then what the
             // tightest member has left
@@ -4954,11 +4970,16 @@ struct Model::Impl {
             for (const Layer& l : L)
                 if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
                     for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
+            // (MIXED-LANE S4: DS4_DRAFT_KEEP caps a drafter block's experts in VRAM - the trunk's hot
+            // experts pay more per byte than a draft's rare ones; the rest read in place)
+            const int draft_keep = std::getenv("DS4_DRAFT_KEEP") != nullptr
+                                       ? std::max(0, std::atoi(std::getenv("DS4_DRAFT_KEEP")))
+                                       : 1 << 30;
             if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
                 for (Layer& l : L)
                     if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
                         double& r = mroom[bm(l)];
-                        l.n_vram = std::min(l.n_exp, (int) std::floor(r / (double) ucount(l)));
+                        l.n_vram = std::min(std::min(l.n_exp, draft_keep), (int) std::floor(r / (double) ucount(l)));
                         r -= (double) l.n_vram * ucount(l);
                     }
             } else {
@@ -5197,6 +5218,14 @@ struct Model::Impl {
                     for (int e = 0; e < l.n_exp; ++e) l.heat[(size_t) e] = (float) (p[e] * sc);
                 }
                 l.hh.assign((size_t) l.n_exp, {nullptr, nullptr, nullptr, nullptr});
+                if (std::getenv("DS4_ARENA_DUMP") != nullptr && l.il >= 0 && l.il < 6) {
+                    std::fprintf(stderr, "ds4: L%d n_vram %d/%d; top-10 profile experts (e, hits, in_vram):\n", l.il, l.n_vram, l.n_exp);
+                    for (int i = 0; i < 10; ++i) {
+                        const int e = order[(size_t) i];
+                        std::fprintf(stderr, "  e=%d hits=%u maddr=%s slot=%d\n", e, p[e],
+                                     l.maddr[(size_t) e] != nullptr ? "VRAM" : "lane", l.slot[(size_t) e]);
+                    }
+                }
                 {   // the CPU-lane experts' host parts: their raw regions (split ones packed into RAM once)
                     for (int e = 0; e < l.n_exp; ++e)
                         if (pk.map(l.region_file[(size_t) e]) == nullptr) {
