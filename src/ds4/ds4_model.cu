@@ -3248,9 +3248,14 @@ struct Model::Impl {
         }
         // the experts: VRAM slots in what each device has left (after the PCIe lane's staging slots), the rest on the host
         if (!lane_alloc(err)) return false;
+        const double t_pe0 = now_ms();   // (S5 boot: placement timed)
+        struct PeScope { double t; ~PeScope() { std::fprintf(stderr, "ds4: place_experts %.1f s\n", (now_ms() - t) / 1000.0); } } pesc_{t_pe0};
         if (!place_experts(err)) return false;
         if (helper_id >= 0 && !helper_select(err)) return false;
         if (!load_experts(err)) return false;
+        const double t_tail0 = now_ms();   // (S5 boot: the unmeasured gap - pools, workers, cache)
+        struct TailScope { double t; ~TailScope() {
+            std::fprintf(stderr, "ds4: tail-pools %.1f s\n", (now_ms() - t) / 1000.0); } } tscope_{t_tail0};
         if (pk.gguf) make_pools();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
@@ -4833,7 +4838,9 @@ struct Model::Impl {
         return true;
     }
 
+    double hh_t0 = 0;   // (S5 boot)
     bool place_experts(std::string& err) {
+        hh_t0 = now_ms();
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
         bool mixed = false;
@@ -5120,6 +5127,7 @@ struct Model::Impl {
         // region, slot-major - the room a run of chunks lays its buffers out in (its chunk size's bytes, at the region's
         // end), the experts' slots the rest of the time
         std::vector<int> n_tail(L.size(), 0);
+        const double t_lend0 = now_ms();   // (S5 boot)
         for (size_t di = 0; di < devs.size() && chunk > 0; ++di) {
             if (di >= chunks.size() || chunks[di] == nullptr || !chunks[di]->borrow) continue;
             Dev& d = devs[di];
@@ -5163,6 +5171,8 @@ struct Model::Impl {
                     n_tail[(size_t) (&l - &L[0])] = k;
                     xoff += align256(unit(l));
                 }
+            if (di + 1 == devs.size() && o.verbose)
+                std::fprintf(stderr, "ds4: tail_lend took %.1f s\n", (now_ms() - t_lend0) / 1000.0);
             if (o.verbose)
                 std::fprintf(stderr, "ds4: CUDA%d lends the prompt path up to %.2f GB of its experts' VRAM (%d slots a "
                                      "layer) while a prompt runs: chunks of up to %d tokens\n", d.id, cap / 1e9, k, chunk);
@@ -5241,27 +5251,51 @@ struct Model::Impl {
                     }
                 }
                 {   // the CPU-lane experts' host parts: their raw regions (split ones packed into RAM once)
+                    const double thh0 = now_ms();   // (S5 boot: hh-loop timed, every 8 layers)
+                    if (l.il % 8 == 0 && o.verbose)
+                        std::fprintf(stderr, "ds4: hh-loop L%d at +%.1f s\n", l.il, (now_ms() - hh_t0) / 1000.0);
                     for (int e = 0; e < l.n_exp; ++e)
                         if (pk.map(l.region_file[(size_t) e]) == nullptr) {
                             err = "mapping " + pk.files[(size_t) l.region_file[(size_t) e]] + " failed";
                             return false;
                         }
-                    for (int e = 0; e < l.n_exp; ++e) {
-                        if (l.slot[(size_t) e] >= 0) continue;
-                        if (!l.esplit[(size_t) e]) {
-                            for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = file_part(l, e);
-                            l.host[(size_t) e] = l.hh[(size_t) e][0];
-                            continue;
-                        }
-                        uint8_t* buf = l.split_host.emplace_back(l.region_bytes[(size_t) e]).data();
-                        if (!read_split(l, e, buf)) {
-                            err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
+                    {   // (S5 boot: the split CPU-lane experts read on threads - one expert's 9 pieces
+                        //  scatter across its class files, so this was ~100 s of seeky reads)
+                        std::vector<int> sp;
+                        for (int e = 0; e < l.n_exp; ++e)
+                            if (l.slot[(size_t) e] < 0 && l.esplit[(size_t) e]) sp.push_back(e);
+                        l.split_host.resize(sp.size());
+                        for (size_t i = 0; i < sp.size(); ++i)
+                            l.split_host[i].resize(l.region_bytes[(size_t) sp[i]]);
+                        std::atomic<size_t> nx{0};
+                        std::atomic<bool> bad{false};
+                        auto work = [&] {
+                            for (size_t i; (i = nx.fetch_add(1)) < sp.size() && !bad.load();)
+                                if (!read_split(l, sp[i], l.split_host[i].data())) { bad.store(true); return; }
+                        };
+                        std::vector<std::thread> ht;
+                        const int hn = std::getenv("DS4_LOAD_THREADS") != nullptr
+                                           ? std::max(1, std::atoi(std::getenv("DS4_LOAD_THREADS"))) : 12;
+                        for (int t = 0; t < hn; ++t) ht.emplace_back(work);
+                        for (auto& t : ht) t.join();
+                        if (bad.load()) {
+                            err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(sp.size()) + " failed";
                             return false;
                         }
-                        for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = buf;
-                        l.host[(size_t) e] = buf;
+                        for (size_t i = 0; i < sp.size(); ++i) {
+                            const int e = sp[i];
+                            for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = l.split_host[i].data();
+                            l.host[(size_t) e] = l.split_host[i].data();
+                        }
+                        for (int e = 0; e < l.n_exp; ++e)
+                            if (l.slot[(size_t) e] < 0 && !l.esplit[(size_t) e]) {
+                                for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = file_part(l, e);
+                                l.host[(size_t) e] = l.hh[(size_t) e][0];
+                            }
                     }
                 }
+                if (l.il == g.nl - 1 && o.verbose)
+                    std::fprintf(stderr, "ds4: hh+arena loop done at +%.1f s\n", (now_ms() - hh_t0) / 1000.0);
                 l.vm.assign((size_t) l.n_exp, {});
                 if (l.n_vram > 0)
                     for (int e = 0; e < l.n_exp; ++e)
@@ -5339,22 +5373,35 @@ struct Model::Impl {
                         err = "mapping " + pk.files[(size_t) l.region_file[(size_t) e]] + " failed";
                         return false;
                     }
-                for (int e = 0; e < l.n_exp; ++e) {
-                    if (l.slot[(size_t) e] >= 0) continue;
-                    if (!l.esplit[(size_t) e]) {   // (one piece: the region whole, every part X, at esrc's offsets)
-                        for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = file_part(l, e);
-                        l.host[(size_t) e] = l.hh[(size_t) e][0];
-                        continue;
+                {   // (S5 boot: branch B's split experts read on threads, like branch A)
+                    std::vector<int> sp;
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] < 0 && l.esplit[(size_t) e]) sp.push_back(e);
+                    l.split_host.resize(sp.size());
+                    for (size_t i = 0; i < sp.size(); ++i)
+                        l.split_host[i].resize(l.region_bytes[(size_t) sp[i]]);
+                    std::atomic<size_t> nx{0};
+                    std::atomic<bool> bad{false};
+                    auto work = [&] {
+                        for (size_t i; (i = nx.fetch_add(1)) < sp.size() && !bad.load();)
+                            if (!read_split(l, sp[i], l.split_host[i].data())) { bad.store(true); return; }
+                    };
+                    std::vector<std::thread> ht;
+                    const int hn = std::getenv("DS4_LOAD_THREADS") != nullptr
+                                       ? std::max(1, std::atoi(std::getenv("DS4_LOAD_THREADS"))) : 12;
+                    for (int t = 0; t < hn; ++t) ht.emplace_back(work);
+                    for (auto& t : ht) t.join();
+                    if (bad.load()) { err = "reading layer " + std::to_string(l.il) + " failed"; return false; }
+                    for (size_t i = 0; i < sp.size(); ++i) {
+                        const int e = sp[i];
+                        for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = l.split_host[i].data();
+                        l.host[(size_t) e] = l.split_host[i].data();
                     }
-                    // (split across files / its pieces apart: its packed region read once into RAM - esrc's
-                    // offsets hold there, where the files' placement cannot)
-                    uint8_t* buf = l.split_host.emplace_back(l.region_bytes[(size_t) e]).data();
-                    if (!read_split(l, e, buf)) {
-                        err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
-                        return false;
-                    }
-                    for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = buf;
-                    l.host[(size_t) e] = buf;
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] < 0 && !l.esplit[(size_t) e]) {
+                            for (int X = 0; X < 4; ++X) l.hh[(size_t) e][(size_t) X] = file_part(l, e);
+                            l.host[(size_t) e] = l.hh[(size_t) e][0];
+                        }
                 }
             } else if (file_experts) {   // every expert's file mapped (the cache's swaps hand VRAM experts back to the files)
                 for (int e = 0; e < l.n_exp; ++e)
@@ -5983,6 +6030,49 @@ struct Model::Impl {
                 return la.region_file[(size_t) a.e] < lb.region_file[(size_t) b.e];
             return la.region_off[(size_t) a.e] < lb.region_off[(size_t) b.e];
         });
+        {   // (S5 boot: merged-extent prewarm - the jobs' bytes read in file order into the page
+            // cache first, so the per-expert preads stop seeking; DS4_PREWARM=0 to skip)
+            if (std::getenv("DS4_PREWARM") == nullptr || std::atoi(std::getenv("DS4_PREWARM")) != 0) {
+                const double tp0 = now_ms();
+                struct Ext { int f; uint64_t a, b; };
+                std::vector<Ext> exts;
+                for (const Job& j : jobs) {
+                    const Layer& l = L[(size_t) j.layer];
+                    exts.push_back({l.region_file[(size_t) j.e], l.region_off[(size_t) j.e],
+                                    l.region_off[(size_t) j.e] + l.region_bytes[(size_t) j.e]});
+                }
+                std::sort(exts.begin(), exts.end(), [](const Ext& x, const Ext& y) {
+                    return x.f != y.f ? x.f < y.f : x.a < y.a;
+                });
+                std::vector<Ext> merged;
+                for (const Ext& x : exts) {
+                    if (!merged.empty() && merged.back().f == x.f && x.a <= merged.back().b + (4ull << 20))
+                        merged.back().b = std::max(merged.back().b, x.b);
+                    else merged.push_back(x);
+                }
+                std::atomic<size_t> ei{0};
+                std::vector<std::thread> pt;
+                std::vector<uint8_t> buf;   // one per thread, below
+                for (int t = 0; t < 4; ++t)
+                    pt.emplace_back([&] {
+                        std::vector<uint8_t> tb(16ull << 20);
+                        for (size_t i; (i = ei.fetch_add(1)) < merged.size();) {
+                            const Ext& x = merged[i];
+                            for (uint64_t o = x.a; o < x.b;) {
+                                const uint64_t n = std::min<uint64_t>(tb.size(), x.b - o);
+                                if (!pk.read_at(x.f, o, n, tb.data())) break;
+                                o += n;
+                            }
+                        }
+                    });
+                for (auto& t : pt) t.join();
+                if (o.verbose)
+                    std::fprintf(stderr, "ds4: prewarm %zu extents (%.1f GB) in %.1f s\n", merged.size(),
+                                 std::accumulate(merged.begin(), merged.end(), 0.0,
+                                                 [](double s, const Ext& x) { return s + (x.b - x.a); }) / 1e9,
+                                 (now_ms() - tp0) / 1000.0);
+            }
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::mutex emu;
