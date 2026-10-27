@@ -1114,6 +1114,7 @@ struct Model::Impl {
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
     bool file_experts = false;
     uint64_t warm_bytes = 0;
+    double ph_parse = 0, ph_experts = 0, ph_mtp = 0;   // (S5 boot: phase timers)
     // DS4_TP_GGUF_UNEVEN=1: a GGUF group's members take its experts' FFN in whole blocks of tp_blk values, as even as
     // they go (splitb, the odd blocks going round the members layer by layer) instead of only even shares
     bool tp_uneven = false;
@@ -3423,10 +3424,23 @@ struct Model::Impl {
                 workers.push_back(std::make_unique<Worker>());
                 workers.back()->start();
             }
-        tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
-        calibrate_paths();
-        lane_setup();
-        if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
+        {   // (S5 boot: tail-phase timers, DS4_BOOT_TAIL verbose)
+            struct T { const char* n; double t; const char* nxt; } ts[] = {
+                {"tune_lane", 0, "calibrate"}, {"calibrate", 0, "lane_setup"}, {"lane_setup", 0, nullptr}};
+            for (auto& t : ts) t.t = now_ms();
+            tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
+            ts[0].nxt = nullptr;
+            calibrate_paths();
+            ts[1].nxt = nullptr;
+            lane_setup();
+            if (std::getenv("DS4_BOOT_TAIL") != nullptr && o.verbose)
+                for (const auto& t : ts)
+                    std::fprintf(stderr, "ds4: tail %-10s %.1f s\n", t.n, (now_ms() - t.t) / 1000.0);
+        }
+        if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s (phases: parse %.1f, experts %.1f, mtp %.1f, tail %.1f)\n%s",
+                                     (now_ms() - t0) / 1000.0,
+                                     ph_parse / 1000.0, ph_experts / 1000.0, ph_mtp / 1000.0,
+                                     (now_ms() - t0 - ph_parse - ph_experts - ph_mtp) / 1000.0, describe().c_str());
         reset();
         return true;
     }
@@ -5439,7 +5453,10 @@ struct Model::Impl {
         std::atomic<int64_t> done_bytes{0};
         const double t0 = now_ms();
         std::vector<std::thread> th;
-        for (int t = 0; t < 12; ++t)
+        // (S5 boot: the same DS4_LOAD_THREADS knob as the trunk loader)
+        const int nth2 = std::getenv("DS4_LOAD_THREADS") != nullptr
+                             ? std::max(1, std::atoi(std::getenv("DS4_LOAD_THREADS"))) : 12;
+        for (int t = 0; t < nth2; ++t)
             th.emplace_back([&] {
                 uint8_t *stage = nullptr, *stage2 = nullptr;
                 cudaHostAlloc((void**) &stage, maxb, cudaHostAllocPortable);
@@ -5910,8 +5927,11 @@ struct Model::Impl {
     }
 
     bool load_experts(std::string& err) {
+        const double t_le0 = now_ms();
+        struct PhScope { double& acc; double t; ~PhScope() { acc += now_ms() - t; } } ph_{ph_experts, t_le0};
         if (!L.empty() && L[0].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
         {   // (MIXED-LANE S4: a hybrid pack - EXL3 trunk, MXFP4 drafter blocks - loads both ways)
+            struct PhScope { double& acc; double t; ~PhScope() { acc += now_ms() - t; } } phm_{ph_mtp, now_ms()};
             bool any_mx = false;
             for (const Layer& l : L)
                 if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -5967,7 +5987,9 @@ struct Model::Impl {
         std::atomic<bool> failed{false};
         std::mutex emu;
         std::string ferr;
-        const int nth = 12;
+        // (S5 boot: DS4_LOAD_THREADS - 12 was tuned for slower NVMe; this box's reads scale past it)
+        const int nth = std::getenv("DS4_LOAD_THREADS") != nullptr
+                            ? std::max(1, std::atoi(std::getenv("DS4_LOAD_THREADS"))) : 12;
         size_t maxr = 0, maxb = 0;
         for (const Layer& l : L) {
             if (l.lay.fmt == gg::kFmtMXFP4) continue;   // (S4: no regions - its own loader)
