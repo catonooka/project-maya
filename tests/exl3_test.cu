@@ -1698,6 +1698,12 @@ int main(int argc, char** argv) {
     test_gemm_rows(1024, 128, 8, 0, 7);
     for (int k2 : {4, 6, 8}) test_set(k2, 2);
     for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu(512, 256, k2);
+    test_cpu(5120, 2304, 4);   // (MIXED-LANE: the 0xSero pack's real expert dims)
+    test_cpu(5120, 2304, 6);
+    test_cpu(5120, 2304, 8);
+    test_cpu(5120, 2304, 10);
+    test_cpu(2304, 5120, 4);   // w2 (down): swapped dims
+    test_cpu(2304, 5120, 6);
     test_cpu(4096, 2048, 6);
     test_cpu(2048, 4096, 6);
     // several activations at once (a verify window): the same bits as one at a time

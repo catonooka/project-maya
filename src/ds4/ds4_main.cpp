@@ -1299,23 +1299,34 @@ int main(int argc, char** argv) {
             const std::vector<int> seq = parse_ids(line);
             if (seq.size() < 2) continue;
             m.reset();
-            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
-                lg.size() < (seq.size() - 1) * (size_t) V) {
-                std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
-                return 1;
-            }
+            // (MIXED-LANE S1: a mixed quant's prompts run in windows without all-row logits - feed in window
+            // slices, each asking its own rows' logits: the same arithmetic, every position scored)
             double s_nll = 0.0;
-            for (size_t i = 0; i + 1 < seq.size(); ++i) {   // row i: the next token's log-probability
-                const float* r = lg.data() + i * (size_t) V;
-                float mx = r[0];
-                for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
-                double z = 0.0;
-                for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
-                s_nll += (double) mx + std::log(z) - (double) r[seq[i + 1]];
+            long long scored_here = 0;
+            bool fok = true;
+            const int PPLW = std::getenv("PPL_WIN") != nullptr ? std::max(1, std::atoi(std::getenv("PPL_WIN"))) : 16;
+            for (size_t a = 0; a + 1 < seq.size() && fok; a += (size_t) PPLW) {
+                const int T = (int) std::min<size_t>((size_t) PPLW, seq.size() - a);
+                const int want = (int) std::min<size_t>((size_t) T, seq.size() - a - 1);
+                if (!m.feed(seq.data() + a, T, want, err) || !m.logits(lg) || (long long) lg.size() < (long long) want * V) {
+                    std::fprintf(stderr, "maya-ds4: sequence %d at %zu: %s\n", k, a, err.empty() ? "no logits" : err.c_str());
+                    fok = false;
+                    break;
+                }
+                for (int i = 0; i < want; ++i) {
+                    const float* r = lg.data() + (size_t) i * V;
+                    float mx = r[0];
+                    for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+                    double z = 0.0;
+                    for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+                    s_nll += (double) mx + std::log(z) - (double) r[seq[a + (size_t) i + 1]];
+                    ++scored_here;
+                }
             }
+            if (!fok) return 1;
             nll += s_nll;
-            scored += (long long) seq.size() - 1;
-            std::fprintf(stderr, "ppl: sequence %d, %zu tokens: %.4f\n", k++, seq.size(), std::exp(s_nll / (double) (seq.size() - 1)));
+            scored += scored_here;
+            std::fprintf(stderr, "ppl: sequence %d, %zu tokens: %.4f\n", k++, seq.size(), std::exp(s_nll / (double) scored_here));
         }
         std::printf("perplexity %.4f over %lld tokens of %d sequences\n", scored ? std::exp(nll / (double) scored) : 0.0,
                     scored, k);

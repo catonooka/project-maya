@@ -848,9 +848,13 @@ static KMix kmix(const MixedLayouts& m) {
     return k;
 }
 __device__ __forceinline__ int mix_cls(const KMix& m, unsigned long long p) {
-    for (int c = 0; c < m.n; ++c)
+    int any = 0;
+    for (int c = 0; c < m.n; ++c) {
+        if (m.hi[c] <= m.lo[c]) continue;   // (an empty class: no arena - never the fallback)
+        any = c + 1;
         if (p >= m.lo[c] && p < m.hi[c]) return c;
-    return 0;
+    }
+    return any - 1;   // (out of every range: the first real class - a staged pointer, S5 tags it)
 }
 union MixSmem {
     BlockSmem<2> k1;
@@ -2217,6 +2221,10 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.limit = a.limit;
     if (a.mix.n > 0) {
         const KMix k = kmix(a.mix);
+        if (std::getenv("EXL3_MIX_TRACE") != nullptr)
+            std::fprintf(stderr, "exl3 win_mix: T %d k %d groups %d n_embd %d n_ff %d mix.n %d grp_ptr %p n_groups %p h %p part %p\n",
+                         a.T, a.k, groups, a.n_embd, a.n_ff, a.mix.n, (void*) a.grp_ptr, (void*) a.n_groups,
+                         (void*) a.h, (void*) a.part);
         mix_launch(a.mix, [&](auto cb) {
             win_gu_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(w, k);
             win_down_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(w, k);
