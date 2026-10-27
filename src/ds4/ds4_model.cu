@@ -4896,7 +4896,7 @@ struct Model::Impl {
                     // each expert's bytes = its class's blob
                     auto eb = [&](int e) { return (double) align256(l.cblob[l.cls[(size_t) e]]); };
                     if (mroom.size() == 1 || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {
-                        // as room goes, class order: pack the cheapest-per-byte classes' experts first
+                        // as room goes, the profile's hottest first (the lane's cost is per expert hit)
                         double r = mroom[0];
                         std::vector<std::pair<double, int>> by_k;   // (bytes an expert, e)
                         for (int e = 0; e < l.n_exp; ++e) by_k.push_back({eb(e), e});
@@ -4910,7 +4910,8 @@ struct Model::Impl {
                         l.n_vram = nv;
                         mroom[0] = r;
                     } else {
-                        // by the profile: the shares smoothed as the uniform path's, a byte the same unit
+                        // by the profile: the hottest experts first (absolute share - the K plan's supers
+                        // and the panel's hot heads; per-byte would pack the small cold K2s instead)
                         const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                         double sum = 0;
                         for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -4920,7 +4921,7 @@ struct Model::Impl {
                         for (int e = 0; e < l.n_exp; ++e) order[(size_t) e] = e;
                         std::sort(order.begin(), order.end(), [&](int a, int b) {
                             if (sh[(size_t) a] != sh[(size_t) b]) return sh[(size_t) a] > sh[(size_t) b];
-                            return eb(a) < eb(b);   // (a tie: the smaller expert - more of them fit)
+                            return eb(a) > eb(b);   // (a tie: the bigger expert - it costs the lane more)
                         });
                         double r = mroom[0];
                         int nv = 0;
@@ -5391,6 +5392,8 @@ struct Model::Impl {
         std::vector<Job> jobs;
         size_t maxb = 0;
         for (const Layer& l : L) {
+            if (l.lay.fmt != gg::kFmtMXFP4) continue;   // (MIXED-LANE S4: a hybrid pack's EXL3 layers
+                                                         // load through their own path)
             maxb = std::max(maxb, l.blob);
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] >= 0 || helper_owned(l, e)) jobs.push_back({l.il, e, l.slot[(size_t) e] < 0});
@@ -5879,6 +5882,19 @@ struct Model::Impl {
 
     bool load_experts(std::string& err) {
         if (!L.empty() && L[0].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
+        {   // (MIXED-LANE S4: a hybrid pack - EXL3 trunk, MXFP4 drafter blocks - loads both ways)
+            bool any_mx = false;
+            for (const Layer& l : L)
+                if (l.lay.fmt == gg::kFmtMXFP4) {
+                    any_mx = true;
+                    for (int r = 0; r < 3; ++r)   // (the lane reads them in place: mapped)
+                        if (pk.map(l.mx_file[r]) == nullptr) {
+                            err = "mapping the drafter's experts (file " + std::to_string(l.mx_file[r]) + ") failed";
+                            return false;
+                        }
+                }
+            if (any_mx && !load_experts_mx(err)) return false;
+        }
         // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
         // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
         // layer) are read once, up to warm_bytes, so the page cache starts with them, and the VRAM ones' pages are
@@ -5887,13 +5903,17 @@ struct Model::Impl {
             int layer, e;
         };
         std::vector<Job> jobs;
-        for (const Layer& l : L)
+        for (const Layer& l : L) {
+            if (l.lay.fmt == gg::kFmtMXFP4) continue;   // (MIXED-LANE S4: an MXFP4 layer - the drafter's
+                                                         // blocks - loads through its own mx path)
             for (int e = 0; e < l.n_exp; ++e)
                 if (!file_experts || l.slot[(size_t) e] >= 0) jobs.push_back({l.il, e});
+        }
         uint64_t warm = 0;
         if (file_experts) {
             std::vector<std::pair<double, Job>> cand;
             for (const Layer& l : L) {
+                if (l.lay.fmt == gg::kFmtMXFP4) continue;   // (S4: the drafter's blocks warm themselves)
                 const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                 double sum = 0;
                 for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -5921,6 +5941,7 @@ struct Model::Impl {
         const int nth = 12;
         size_t maxr = 0, maxb = 0;
         for (const Layer& l : L) {
+            if (l.lay.fmt == gg::kFmtMXFP4) continue;   // (S4: no regions - its own loader)
             maxb = std::max(maxb, l.blob);
             for (uint64_t r : l.region_bytes) maxr = std::max<size_t>(maxr, r);
         }
