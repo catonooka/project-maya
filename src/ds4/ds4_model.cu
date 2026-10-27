@@ -1262,10 +1262,12 @@ struct Model::Impl {
     // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS: 1 on one GPU - 4 measured no
     // faster on one V100 - and 4 on several, a group's members' copies each: each its staging buffers and copy
     // streams), switched between windows
+    static constexpr unsigned long long kZero8 = 0ull;   // (the mixed swap's table writes)
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
         unsigned win = 0;   // (win_now at the tick that queued it)
+        uint8_t* fill = nullptr;   // (S5 mixed: the out expert's region, materialized for the CPU lane)
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1535,6 +1537,7 @@ struct Model::Impl {
     std::mutex sw_mu;
     std::condition_variable sw_cv;
     std::deque<Swap> sw_queue;
+    std::vector<std::vector<std::vector<uint8_t>>> sw_fill_bufs;   // (S5 mixed: [layer] the evicted's regions)
     std::vector<Swap> sw_ready;
     struct SwapBufs {
         uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
@@ -3433,7 +3436,8 @@ struct Model::Impl {
             struct T { const char* n; double t; const char* nxt; } ts[] = {
                 {"tune_lane", 0, "calibrate"}, {"calibrate", 0, "lane_setup"}, {"lane_setup", 0, nullptr}};
             for (auto& t : ts) t.t = now_ms();
-            tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
+            sw_fill_bufs.resize(L.size());   // (S5 mixed swaps)
+        tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
             ts[0].nxt = nullptr;
             calibrate_paths();
             ts[1].nxt = nullptr;
@@ -7541,7 +7545,6 @@ struct Model::Impl {
                 sw_ready.push_back(sw);
                 continue;
             }
-            parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
             auto off_turn = [&](int di, cudaStream_t cs) {   // (false: quitting)
                 while (!copy_open(di, sw.win)) {
                     if (quit.load()) return false;
@@ -7550,6 +7553,46 @@ struct Model::Impl {
                 copy_after_idle(di, cs);
                 return true;
             };
+            if (l.n_cls > 1 && !l.maddr.empty()) {   // (S5: a mixed swap - its region read, repacked to its
+                //  class layout, H2D straight into the out expert's arena slot)
+                uint8_t* dst = l.maddr[(size_t) sw.out];
+                const size_t nb = l.cblob[l.cls[(size_t) sw.in]];
+                bool ok = l.esplit[(size_t) sw.in]
+                              ? read_split(l, sw.in, B.a)
+                              : pk.read_at(l.region_file[(size_t) sw.in], l.region_off[(size_t) sw.in],
+                                           l.region_bytes[(size_t) sw.in], B.a);
+                if (ok) {
+                    repack(l, sw.in, B.a, B.a);   // (in place: esrc's pieces land at the class layout's offsets)
+                    Dev& d = devs[(size_t) l.dev];
+                    cudaSetDevice(d.id);
+                    cudaStream_t cs = B.st[(size_t) l.dev];
+                    if (!off_turn(l.dev, cs)) return;
+                    cudaMemcpyAsync(dst, B.a, nb, cudaMemcpyHostToDevice, cs);
+                    cudaStreamSynchronize(cs);
+                }
+                {   // (S5: the out expert's region for the CPU lane - a VRAM one was never
+                    //  materialized (its load staged and uploaded); read it packed, esplit or whole)
+                    static std::mutex fill_mu;
+                    uint8_t* fb = nullptr;
+                    {
+                        std::lock_guard<std::mutex> gk(fill_mu);   // (split_host grows; the lane reads it)
+                        sw_fill_bufs[l.il].emplace_back(l.region_bytes[(size_t) sw.out]);
+                        fb = sw_fill_bufs[l.il].back().data();
+                    }
+                    const bool ok2 = l.esplit[(size_t) sw.out]
+                                         ? read_split(l, sw.out, fb)
+                                         : pk.read_at(l.region_file[(size_t) sw.out], l.region_off[(size_t) sw.out],
+                                                      l.region_bytes[(size_t) sw.out], fb);
+                    if (ok2) sw.fill = fb;
+                }
+                {   // (straight to sw_ready - the switch handles the mixed bookkeeping)
+                    std::lock_guard<std::mutex> lk(sw_mu);
+                    sw_ready.push_back(sw);
+                    --sw_inflight;
+                }
+                continue;
+            }
+            parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
             if (l.nm == 1) {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
@@ -8025,6 +8068,42 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (l.n_cls > 1 && !l.maddr.empty()) {   // (S5: the mixed switch - addresses trade places)
+                uint8_t* a_out = l.maddr[(size_t) sw.out];
+                l.maddr[(size_t) sw.out] = nullptr;
+                l.maddr[(size_t) sw.in] = a_out;
+                l.slot[(size_t) sw.out] = -1;
+                l.slot[(size_t) sw.in] = sw.in;   // (mixed: slot e = expert e)
+                if (sw.fill != nullptr) {   // (its region, read by the swap thread)
+                    for (int X = 0; X < 4; ++X) l.hh[(size_t) sw.out][(size_t) X] = sw.fill;
+                    l.host[(size_t) sw.out] = sw.fill;
+                } else if (l.host[(size_t) sw.out] != nullptr) {   // (never left the files' pages)
+                    // its hh entries stand (esplit: its packed region; whole: its file pages)
+                } else {
+                    for (int X = 0; X < 4; ++X) l.hh[(size_t) sw.out][(size_t) X] = file_part(l, sw.out);
+                    l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+                }
+                l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
+                l.host[(size_t) sw.in] = nullptr;
+                {   // (S5: the mixed tables written DIRECTLY - tick_flush's pair budget would
+                    //  drop some of the 4 pairs a swap needs, leaving stale GPU tables: segfault)
+                    Dev& d = devs[(size_t) l.dev];
+                    cudaSetDevice(d.id);
+                    unsigned long long a_in = (unsigned long long) l.maddr[(size_t) sw.in], zero = 0ull;
+                    (void) cudaMemcpyAsync(l.vram_tab + sw.out, &zero, 8, cudaMemcpyHostToDevice, d.st);
+                    (void) cudaMemcpyAsync(l.vram_tab + sw.in, &a_in, 8, cudaMemcpyHostToDevice, d.st);
+                    if (l.d_maddr != nullptr) {   // (the mixed decode path reads d_maddr)
+                        (void) cudaMemcpyAsync(l.d_maddr + sw.out, &zero, 8, cudaMemcpyHostToDevice, d.st);
+                        (void) cudaMemcpyAsync(l.d_maddr + sw.in, &a_in, 8, cudaMemcpyHostToDevice, d.st);
+                    }
+                    cudaStreamSynchronize(d.st);   // (a_in/zero are stack: hold until landed)
+                }
+                l.swap_pending = false;
+                l.sw_in = -1;
+                --sw_inflight;
+                ++st.swaps;
+                continue;
+            }
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
@@ -8088,6 +8167,27 @@ struct Model::Impl {
                 if (!filling && l.slot[(size_t) e] < 0 && !helper_owned(l, e) &&
                     (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best]))
                     best = e;
+            }
+            if (best >= 0 && l.n_cls > 1 && !l.maddr.empty() && !l.swap_pending && sw_inflight < c_inflight &&
+                std::getenv("DS4_MIX_SWAP") != nullptr) {   // (S5: a mixed layer - into the out's own arena slot; the
+                //  spare-slot scheme needs none: the tables switch between windows, the out's host source never moved)
+                int cold = -1;
+                for (int e = 0; e < l.n_exp; ++e) {
+                    const bool in_arena = l.maddr[(size_t) e] != nullptr;
+                    if (!in_arena || l.cls[(size_t) e] != l.cls[(size_t) best]) continue;
+                    if (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold]) cold = e;
+                }
+                if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
+                    l.swap_pending = true;
+                    l.sw_in = best;
+                    ++sw_inflight;
+                    vin = best;
+                    Swap sw{l.il, best, cold};
+                    sw.win = win_now.load(std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lk(sw_mu);
+                    sw_queue.push_back(sw);
+                    queued = true;
+                }
             }
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;   // (of the layer's own slots: a recent slot's expert stays)
