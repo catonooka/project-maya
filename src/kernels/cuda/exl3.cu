@@ -848,6 +848,7 @@ static KMix kmix(const MixedLayouts& m) {
     return k;
 }
 __device__ __forceinline__ int mix_cls(const KMix& m, unsigned long long p) {
+    if (p & 0xffull) return (int) (p & 0xffull) - 1;   // (S3: a staged pointer's tag - cls + 1 - wins over the ranges)
     int any = 0;
     for (int c = 0; c < m.n; ++c) {
         if (m.hi[c] <= m.lo[c]) continue;   // (an empty class: no arena - never the fallback)
@@ -890,7 +891,7 @@ __global__ void EXL3_BOUNDS(2) moe_gate_up_mix_kernel(const KMoe a, const KMix m
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
@@ -916,7 +917,7 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     if (a.skip != nullptr && *a.skip) return;
     if (ptr != 0ull) {
         const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-        const uint8_t* blob = (const uint8_t*) ptr;
+        const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
@@ -950,7 +951,7 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
@@ -979,7 +980,7 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
@@ -1444,7 +1445,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, c
     const int nc = min(kTok, end - start - (int) blockIdx.x * kTok);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
     const int c = mix_cls(mx, ptr);
     if constexpr (gate_up) {
         Xin in;
@@ -1649,7 +1650,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix 
     const int nc = min(NR, end - start - (int) blockIdx.x * NR);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = (const uint8_t*) (ptr & ~0xffull);
     const int c = mix_cls(mx, ptr);
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;

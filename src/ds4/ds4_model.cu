@@ -619,6 +619,8 @@ struct Chunk {
     uint8_t* ring = nullptr;
     size_t ring_stride = 0;
     int ring_n = 0;
+    unsigned long long* ring_ptr_dev = nullptr;   // (S3 mixed: a batch's tagged ring pointers - dst | cls + 1)
+    unsigned long long* ring_ptr_pin = nullptr;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
     // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
@@ -1573,6 +1575,7 @@ struct Model::Impl {
     //  re-enters VRAM: without that return, a long window-mode prompt grew this without bound (OOM at 251 GB))
     std::vector<std::vector<std::unique_ptr<std::vector<uint8_t>>>> sw_fill_bufs;
     std::mutex fill_mu;   // (S5 mixed: guards sw_fill_bufs - the swap threads fill, the switch frees)
+    std::atomic<bool> prompt_active{false};   // (S3: a chunk run reads maddr/vs state - no mixed switch mid-run)
     std::vector<Swap> sw_ready;
     struct SwapBufs {
         uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
@@ -2628,8 +2631,8 @@ struct Model::Impl {
         // (MIXED-LANE S1: a mixed-precision quant's chunks stage CPU-lane experts outside the class arenas - windows
         // until the class tag rides the pointers)
         bool any_mixed = false;
-        for (const Layer& l : L) any_mixed = any_mixed || l.n_cls > 1;
-        chunk = prompt_par && !any_mixed
+        for (const Layer& l : L) any_mixed = any_mixed || l.n_cls > 1;   // (L empty here: the real gate is below)
+        chunk = prompt_par
                     ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : devs.size() > 1 ? 4096 : 2048)
                     : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
@@ -2835,11 +2838,8 @@ struct Model::Impl {
         {
             bool am = false;
             for (const Layer& l : L) am = am || l.n_cls > 1;
-            if (am && chunk > 0) {
-                chunk = 0;
-                std::fprintf(stderr, "ds4: a mixed-precision quant: prompts in windows of %d (chunks stage outside "
-                                     "the class arenas for now)\n", kWin);
-            }
+            if (am && chunk > 0 && o.verbose)
+                std::fprintf(stderr, "ds4: a mixed-precision quant: prompts in chunks (S3 tagged ring staging)\n");
         }
         // the groups' members: copies of each layer's device state, a member's part of an expert
         for (Layer& l : L) {
@@ -3273,6 +3273,11 @@ struct Model::Impl {
         }
         NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
+        {   // (S3: a mixed layer's split staging reads its parts at class-0's geometry - whole experts only)
+            bool am = false;
+            for (const Layer& l : L) am = am || l.n_cls > 1;
+            if (am) NH = 1;
+        }
         if (!pk.gguf) make_pools();   // (a GGUF's after its experts: copy_experts decides NH)
         {
             const size_t E = (size_t) g.dim, FF = (size_t) g.ff, GQ = E / 256, DQ = FF / 128, S = kSlots;
@@ -3656,6 +3661,13 @@ struct Model::Impl {
                 c.ring_stride = stride;
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
+                {   // (S3 mixed: the ring's pointer table, a tagged entry a slot)
+                    bool am = false;
+                    for (const Layer& l : L) am = am || l.n_cls > 1;
+                    if (am && (!dalloc(d, c.ring_ptr_dev, (size_t) c.ring_n * 8, err) ||
+                               !halloc(c.ring_ptr_pin, (size_t) c.ring_n, err)))
+                        return false;
+                }
             }
             const size_t down_b = flow_down_bytes((int) di);   // (the flow's down scratch, where it takes one)
             if (down_b > 0 && !dalloc(d, c.down, down_b, err)) return false;
@@ -4028,6 +4040,18 @@ struct Model::Impl {
                                    sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
                     return false;
                 c.stream_bytes += (double) unit(member(l0, mi));
+            }
+            if (l0.n_cls > 1 && c.ring_ptr_pin != nullptr) {   // (S3: this batch's tagged ring pointers - class + 1
+                //  in the low byte - out before the batch is Usable, so the compute stream's wait covers them too)
+                for (int i = 0; i < bt.n; ++i) {
+                    const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                    uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
+                    c.ring_ptr_pin[(size_t) half * (c.ring_n / P) + i] =
+                        (unsigned long long) dst | (unsigned long long) (l0.cls[(size_t) e] + 1);
+                }
+                CK(cudaMemcpyAsync(c.ring_ptr_dev + (size_t) half * (c.ring_n / P),
+                                   c.ring_ptr_pin + (size_t) half * (c.ring_n / P), (size_t) bt.n * 8,
+                                   cudaMemcpyHostToDevice, c.cs));
             }
             CK(cudaEventRecord(c.filled[half], c.cs));
             ++S.cp;
@@ -4437,6 +4461,8 @@ struct Model::Impl {
     // vram_base and xbase), through run_set with layer l's layout
     bool run_vram(Dev& d, Chunk& c, const Layer& L0, const Layer& l, const Layer& x, const int* b, int i0, int i1, int T,
                   std::string& err) {
+        if (L0.n_cls > 1)   // (S3: mixed - every VRAM expert by its own maddr, vs = expert id, no borrowed tail)
+            return run_set(d, c, l, x.vram_base, 0, unit(x), c.bounds, b, i0, i1, T, err, l.d_maddr, 0);
         const int m = std::min(i1, L0.n_main), t0 = std::max(i0, L0.n_main);
         if (i0 < m && !run_set(d, c, l, x.vram_base, 0, unit(x), c.bounds, b, i0, m, T, err)) return false;
         return t0 >= i1 || run_set(d, c, l, x.xbase, L0.n_main, x.xstep, c.bounds, b, t0, i1, T, err);
@@ -4444,7 +4470,8 @@ struct Model::Impl {
     // the experts [i0, i1) of a sorted set (blobs at wbase + i * stride; bounds b on the host, d_bounds on the device)
     // over the chunk's rows, in pieces of at most C rows, each added into acc in pick order
     bool run_set(Dev& d, Chunk& c, const Layer& l, const uint8_t* wbase, int wb0, size_t stride, const int* d_bounds,
-                 const int* b, int i0, int i1, int T, std::string& err) {
+                 const int* b, int i0, int i1, int T, std::string& err,
+                 const unsigned long long* eptr = nullptr, int e_base = 0) {
         const int D = g.dim, FF = l.ffn;
         while (i0 < i1) {
             int j = i0 + 1;
@@ -4457,9 +4484,10 @@ struct Model::Impl {
                 sa.wbase = wbase + (size_t) (i0 - wb0) * stride;   // (wbase: set member wb0's blob)
                 sa.stride = stride;
                 sa.lay = l.nm > 1 ? l.hlay : l.lay;
-                if (l.n_cls > 1 && wbase == l.vram_base) {   // (a mixed layer: its experts' own addresses, slot = expert)
+                if (l.n_cls > 1 && eptr != nullptr) {   // (a mixed layer: its experts' own addresses - VRAM's are
+                    //  maddr[e] (vs = expert id), the ring's tagged staging pointers; S3's class tag rides the low byte)
                     sa.mix = l.mix;
-                    sa.eptr = l.d_maddr + i0;
+                    sa.eptr = eptr + (i0 - e_base);
                 }
                 sa.n_exp = j - i0;
                 sa.bounds = d_bounds + i0;
@@ -7620,10 +7648,10 @@ struct Model::Impl {
                                                       l.region_bytes[(size_t) sw.out], fb);
                     if (ok2) sw.fill = fb;
                 }
-                {   // (straight to sw_ready - the switch handles the mixed bookkeeping)
+                {   // (straight to sw_ready - the switch handles the mixed bookkeeping; still in flight -
+                    //  the switch's landing is the one decrement, so the cap and the drain check hold)
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_ready.push_back(sw);
-                    --sw_inflight;
                 }
                 continue;
             }
@@ -8113,6 +8141,13 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (prompt_active.load(std::memory_order_acquire) && l.n_cls > 1 && !l.maddr.empty()) {
+                // (S3: a chunk run owns the tables - requeue for the next window; it cannot deadlock: the run
+                //  ends, and the in-flight count stands: this swap never landed)
+                std::lock_guard<std::mutex> lk(sw_mu);
+                sw_ready.push_back(sw);
+                continue;
+            }
             if (l.n_cls > 1 && !l.maddr.empty()) {   // (S5: the mixed switch - addresses trade places)
                 uint8_t* a_out = l.maddr[(size_t) sw.out];
                 l.maddr[(size_t) sw.out] = nullptr;
@@ -8225,7 +8260,7 @@ struct Model::Impl {
             std::sort(cands.begin(), cands.end(), [&](int a, int b) { return l.heat[(size_t) a] > l.heat[(size_t) b]; });
             if (!cands.empty()) best = cands.front();
             if (best >= 0 && l.n_cls > 1 && !l.maddr.empty() && l.sw_pending == 0 && sw_inflight < c_inflight &&
-                std::getenv("DS4_MIX_SWAP") != nullptr) {   // (S5: a mixed layer - into the out's own arena slot; the
+                std::getenv("DS4_MIX_SWAP") != nullptr && !prompt_active.load(std::memory_order_acquire)) {   // (S5: a mixed layer - into the out's own arena slot; the
                 //  spare-slot scheme needs none: the tables switch between windows, the out's host source never moved.
                 //  DS4_CACHE_BATCH pairs a tick: the hottest candidates each take the coldest free victim of their
                 //  class - convergence-bound prose no longer waits a swap a layer a window)
@@ -11476,7 +11511,10 @@ struct Model::Impl {
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
                   c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
         }
-        const int n_vs = L0.pv_n + (int) L0.host_list.size();
+        const int mx = L0.n_cls > 1;   // (S3: mixed vs space - [0, n_exp) VRAM by expert id, then the lane's)
+        const int n_v0 = mx ? L0.n_exp : L0.pv_n;
+        const int n_vs = n_v0 + (int) L0.host_list.size();
+        if (n_vs > 2047) { err = "layer " + std::to_string(L0.il) + ": " + std::to_string(n_vs) + " virtual slots"; return false; }
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
@@ -11557,18 +11595,19 @@ struct Model::Impl {
             const Batch& bt = S.b[S.kp];
             const int half = (int) (S.kp % P);
             CK(cudaStreamWaitEvent(s, c.filled[half], 0));
-            const int v0 = L0.pv_n + bt.j0;
+            const int v0 = n_v0 + bt.j0;
             if (!run_set(d, c, l, c.ring + (size_t) half * (c.ring_n / P) * c.ring_stride, v0, c.ring_stride, c.bounds,
-                         b.data(), v0, v0 + bt.n, T, err))
+                         b.data(), v0, v0 + bt.n, T, err,
+                         mx ? c.ring_ptr_dev + (size_t) half * (c.ring_n / P) : nullptr, v0))
                 return false;
             CK(cudaEventRecord(c.freed[half], s));
             ++S.kp;
             if (!copy_ahead(d, c, S, di, err)) return false;
-            const int v_to = (int) ((int64_t) L0.pv_n * (bi + 1) / nb);
+            const int v_to = (int) ((int64_t) n_v0 * (bi + 1) / nb);
             if (!run_vram(d, c, L0, l, l, b.data(), v_done, v_to, T, err)) return false;
             v_done = v_to;
         }
-        if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (!run_vram(d, c, L0, l, l, b.data(), v_done, n_v0, T, err)) return false;
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -11581,14 +11620,19 @@ struct Model::Impl {
     void plan_streams() {
         for (Layer& l : L) {
             if (l.mtp || l.vs_pin == nullptr) continue;
+            const bool mx = l.n_cls > 1;   // (S3: a mixed layer's vs = expert id in VRAM, n_exp + j on the lane -
+            //  its slots are expert ids, not dense [0, pv_n), so the dense test would file hot VRAM experts as lane)
             l.host_list.clear();
             for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] < 0 || l.slot[(size_t) e] >= l.pv_n) l.host_list.push_back(e);
+                if (mx ? l.slot[(size_t) e] < 0
+                       : (l.slot[(size_t) e] < 0 || l.slot[(size_t) e] >= l.pv_n)) l.host_list.push_back(e);
             for (int m = 0; m < l.nm; ++m) {   // (a group's members: each its own copy)
                 Layer& x = member(l, m);
                 int j = 0;
                 for (int e = 0; e < l.n_exp; ++e)
-                    x.vs_pin[e] = l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.pv_n ? l.slot[(size_t) e] : l.pv_n + j++;
+                    x.vs_pin[e] = mx ? (l.slot[(size_t) e] >= 0 ? e : l.n_exp + j++)
+                                     : (l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.pv_n ? l.slot[(size_t) e]
+                                                                                               : l.pv_n + j++);
             }
         }
     }
