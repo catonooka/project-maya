@@ -798,8 +798,8 @@ struct Layer {
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
-    bool swap_pending = false;
-    int sw_in = -1;                             // the expert a pending swap brings in (the recent slots leave it be)
+    int sw_pending = 0;                         // (S5: this layer's swaps under way - a tick may queue DS4_CACHE_BATCH)
+    std::vector<int> sw_ins;                    // the experts they bring in (the recent slots leave them be)
     unsigned long long* tab_pin = nullptr;      // pinned: the table entries a swap writes
     // the recent slots (DS4_RECENT): rc_n VRAM slots from rc_base, each a copy of a CPU-lane expert the layer used
     // lately - its RAM parts stay where they are, so one goes out by its table entry alone; least recently used out
@@ -1302,6 +1302,7 @@ struct Model::Impl {
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
+    const int c_batch = std::max(1, (int) env_f("DS4_CACHE_BATCH", 1.0f));   // (S5: mixed swaps a layer a tick)
     // the RAM tier (a GGUF's in-place experts, as GLM's: the hottest in VRAM, the next hottest here, the coldest in the
     // files): RAM slots of one expert blob each, filled at load with the hottest experts VRAM does not hold, so the
     // CPU lane reads them from RAM; between windows (cache_tick) a hotter expert from the files takes the place of the
@@ -7905,7 +7906,8 @@ struct Model::Impl {
             int started = 0;
             for (size_t h = l.cpu_hits.size(); start_fills && h-- > 0 && started < recent_fills;) {   // (latest first)
                 const int e = l.cpu_hits[h];
-                if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 || e == l.sw_in) continue;
+                if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 ||
+                    std::find(l.sw_ins.begin(), l.sw_ins.end(), e) != l.sw_ins.end()) continue;
                 int uses = 0;
                 for (const std::vector<int>& hv : l.rc_hist) uses += std::binary_search(hv.begin(), hv.end(), e) ? 1 : 0;
                 if (uses < recent_need) continue;
@@ -8147,8 +8149,9 @@ struct Model::Impl {
                     }
                     cudaStreamSynchronize(d.st);   // (a_in/zero are stack: hold until landed)
                 }
-                l.swap_pending = false;
-                l.sw_in = -1;
+                if (l.sw_pending > 0) --l.sw_pending;
+                for (size_t qi = 0; qi < l.sw_ins.size(); ++qi)
+                    if (l.sw_ins[qi] == sw.in) { l.sw_ins.erase(l.sw_ins.begin() + (long) qi); break; }
                 --sw_inflight;
                 ++st.swaps;
                 continue;
@@ -8193,8 +8196,9 @@ struct Model::Impl {
                 u.push_back((unsigned long long) (x.vram_tab + sw.out));
                 u.push_back(0ull);
             }
-            l.swap_pending = false;
-            l.sw_in = -1;
+            if (l.sw_pending > 0) --l.sw_pending;
+            for (size_t qi = 0; qi < l.sw_ins.size(); ++qi)
+                if (l.sw_ins[qi] == sw.in) { l.sw_ins.erase(l.sw_ins.begin() + (long) qi); break; }
             --sw_inflight;
             ++st.swaps;
         }
@@ -8208,37 +8212,49 @@ struct Model::Impl {
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
             int best = -1, vin = -1;
+            std::vector<int> cands;   // (S5 batch: the tick's in-candidates, hottest first)
             for (int e : hits) {
                 bool filling = false;   // (a recent slot's fill brings it: the swaps leave it be)
                 for (int i = 0; i < l.rc_n; ++i) filling = filling || l.rc_fill[(size_t) i] == e;
                 // (never one of the helper's either: its picks are its own, in one place - the sync path's hits can
                 //  name them)
                 if (!filling && l.slot[(size_t) e] < 0 && !helper_owned(l, e) &&
-                    (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best]))
-                    best = e;
+                    std::find(l.sw_ins.begin(), l.sw_ins.end(), e) == l.sw_ins.end())
+                    cands.push_back(e);
             }
-            if (best >= 0 && l.n_cls > 1 && !l.maddr.empty() && !l.swap_pending && sw_inflight < c_inflight &&
+            std::sort(cands.begin(), cands.end(), [&](int a, int b) { return l.heat[(size_t) a] > l.heat[(size_t) b]; });
+            if (!cands.empty()) best = cands.front();
+            if (best >= 0 && l.n_cls > 1 && !l.maddr.empty() && l.sw_pending == 0 && sw_inflight < c_inflight &&
                 std::getenv("DS4_MIX_SWAP") != nullptr) {   // (S5: a mixed layer - into the out's own arena slot; the
-                //  spare-slot scheme needs none: the tables switch between windows, the out's host source never moved)
-                int cold = -1;
-                for (int e = 0; e < l.n_exp; ++e) {
-                    const bool in_arena = l.maddr[(size_t) e] != nullptr;
-                    if (!in_arena || l.cls[(size_t) e] != l.cls[(size_t) best]) continue;
-                    if (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold]) cold = e;
-                }
-                if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
-                    l.swap_pending = true;
-                    l.sw_in = best;
+                //  spare-slot scheme needs none: the tables switch between windows, the out's host source never moved.
+                //  DS4_CACHE_BATCH pairs a tick: the hottest candidates each take the coldest free victim of their
+                //  class - convergence-bound prose no longer waits a swap a layer a window)
+                std::vector<char> victim((size_t) l.n_exp, 0);
+                int done = 0;
+                for (int e : cands) {
+                    if (done >= c_batch || sw_inflight >= c_inflight) break;
+                    int cold = -1;
+                    for (int q = 0; q < l.n_exp; ++q) {
+                        const bool in_arena = l.maddr[(size_t) q] != nullptr;
+                        if (!in_arena || l.cls[(size_t) q] != l.cls[(size_t) e] || victim[(size_t) q]) continue;
+                        if (cold < 0 || l.heat[(size_t) q] < l.heat[(size_t) cold]) cold = q;
+                    }
+                    if (cold < 0) continue;
+                    if (l.heat[(size_t) e] <= l.heat[(size_t) cold] * c_margin + c_bonus) break;   // (hottest first)
+                    victim[(size_t) cold] = 1;
+                    ++l.sw_pending;
+                    l.sw_ins.push_back(e);
                     ++sw_inflight;
-                    vin = best;
-                    Swap sw{l.il, best, cold};
+                    if (vin < 0) vin = e;
+                    Swap sw{l.il, e, cold};
                     sw.win = win_now.load(std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
                     queued = true;
+                    ++done;
                 }
             }
-            if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
+            if (best >= 0 && l.spare_vram >= 0 && l.sw_pending == 0 && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;   // (of the layer's own slots: a recent slot's expert stays)
                 for (int e = 0; e < l.n_exp; ++e) {
                     const int sl = l.slot[(size_t) e];
@@ -8247,8 +8263,8 @@ struct Model::Impl {
                         cold = e;
                 }
                 if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
-                    l.swap_pending = true;
-                    l.sw_in = best;
+                    ++l.sw_pending;
+                    l.sw_ins.push_back(best);
                     ++sw_inflight;
                     vin = best;
                     Swap sw{l.il, best, cold};
@@ -9935,7 +9951,8 @@ struct Model::Impl {
     unsigned long long land_dst(Layer& l, int e, int q, unsigned seq, const int (*ids)[kPicks], int T) {
         // A pending swap already owns this expert's destination. Landing it too would leave two owners and
         // publish two different vram_tab[e] values in one unordered tab_set batch.
-        if (!ln_land || l.rc_n == 0 || l.nm != 1 || e == l.sw_in) return 0ull;
+        if (!ln_land || l.rc_n == 0 || l.nm != 1 ||
+            std::find(l.sw_ins.begin(), l.sw_ins.end(), e) != l.sw_ins.end()) return 0ull;
         int v = -1;
         for (int i = 0; i < l.rc_n; ++i) {
             if (l.rc_fill[(size_t) i] >= 0 || l.rc_land[(size_t) i] >= 0) continue;
@@ -12871,8 +12888,8 @@ struct Model::Impl {
                                 cold = q;
                         if (cold < 0 || l.heat[(size_t) e] <= l.heat[(size_t) cold]) continue;
                         if (sw_inflight >= c_inflight + 64) break;   // (bounded burst)
-                        l.swap_pending = true;
-                        l.sw_in = e;
+                        ++l.sw_pending;
+                        l.sw_ins.push_back(e);
                         ++sw_inflight;
                         Swap sw{l.il, e, cold};
                         sw.win = w_now;
