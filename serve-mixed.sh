@@ -12,7 +12,9 @@ export MAYA_DS4_Q8_BATCH=1
 export MAYA_DS4_SLOT_KEEP=1
 # S5 mixed-lane line
 export DS4_MIX_SWAP=1
-export DS4_PROMPT_SWAPS=${DS4_PROMPT_SWAPS:-4}
+# final 2026-10-28 sweep verdict: ps8 + marg11 won; BATCH>1, THREADS=6, INFL12 rejected (DDR4 thrash / no add)
+export DS4_PROMPT_SWAPS=${DS4_PROMPT_SWAPS:-8}
+export DS4_CACHE_MARGIN=${DS4_CACHE_MARGIN:-1.1}
 export DS4_WARM_CAP_GB=${DS4_WARM_CAP_GB:-90}
 export DS4_LOAD_THREADS=${DS4_LOAD_THREADS:-24}
 # A/B passthroughs (set before calling to override)
