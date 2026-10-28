@@ -1567,7 +1567,11 @@ struct Model::Impl {
     std::mutex sw_mu;
     std::condition_variable sw_cv;
     std::deque<Swap> sw_queue;
-    std::vector<std::vector<std::vector<uint8_t>>> sw_fill_bufs;   // (S5 mixed: [layer] the evicted's regions)
+    // (S5 mixed: [layer] the evicted's regions, each owned by a unique_ptr so freeing one never moves the
+    //  others - a swapped-out expert's region lives here while the lane reads it, and comes back when it
+    //  re-enters VRAM: without that return, a long window-mode prompt grew this without bound (OOM at 251 GB))
+    std::vector<std::vector<std::unique_ptr<std::vector<uint8_t>>>> sw_fill_bufs;
+    std::mutex fill_mu;   // (S5 mixed: guards sw_fill_bufs - the swap threads fill, the switch frees)
     std::vector<Swap> sw_ready;
     struct SwapBufs {
         uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
@@ -7602,12 +7606,12 @@ struct Model::Impl {
                 }
                 {   // (S5: the out expert's region for the CPU lane - a VRAM one was never
                     //  materialized (its load staged and uploaded); read it packed, esplit or whole)
-                    static std::mutex fill_mu;
                     uint8_t* fb = nullptr;
                     {
                         std::lock_guard<std::mutex> gk(fill_mu);   // (split_host grows; the lane reads it)
-                        sw_fill_bufs[l.il].emplace_back(l.region_bytes[(size_t) sw.out]);
-                        fb = sw_fill_bufs[l.il].back().data();
+                        sw_fill_bufs[l.il].emplace_back(std::make_unique<std::vector<uint8_t>>(
+                            l.region_bytes[(size_t) sw.out]));
+                        fb = sw_fill_bufs[l.il].back()->data();
                     }
                     const bool ok2 = l.esplit[(size_t) sw.out]
                                          ? read_split(l, sw.out, fb)
@@ -8121,6 +8125,12 @@ struct Model::Impl {
                 } else {
                     for (int X = 0; X < 4; ++X) l.hh[(size_t) sw.out][(size_t) X] = file_part(l, sw.out);
                     l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+                }
+                if (l.host[(size_t) sw.in] != nullptr) {   // (its own fill buffer, back from the lane: free it)
+                    const uint8_t* mine = l.host[(size_t) sw.in];
+                    std::lock_guard<std::mutex> gk(fill_mu);
+                    for (std::unique_ptr<std::vector<uint8_t>>& b : sw_fill_bufs[l.il])
+                        if (b != nullptr && b->data() == mine) { b.reset(); break; }
                 }
                 l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
                 l.host[(size_t) sw.in] = nullptr;
