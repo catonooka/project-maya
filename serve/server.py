@@ -3430,6 +3430,10 @@ class Service:
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
+        _cmax = os.environ.get("STRATA_CONV_MAX", "").strip()
+        if _cmax.isdigit() and int(_cmax) > 0 and len(ids) > int(_cmax):
+            # local: cap one conversation's size (the engine pool may be far larger)
+            raise ValueError(f"prompt is {len(ids)} tokens; a conversation is capped at {_cmax} here (STRATA_CONV_MAX)")
         self.embeddings.path = None
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -6540,7 +6544,7 @@ class Server(ThreadingHTTPServer):
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
-              "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
+              "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE", "STRATA_SPEC_DEFAULT", "STRATA_CONV_MAX") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 
